@@ -111,7 +111,7 @@ jobs:
           subprocess.run(cmd, check=True)
           PYEOF
 
-      - name: Strict E2E verification gate on standalone binary (JSON + SARIF 2.1.0 + clean file)
+      - name: Strict E2E verification gate on standalone binary (CWE-78 + SARIF 2.1.0 + clean file)
         shell: bash
         env:
           ASSET_NAME: ${{ matrix.asset_name }}
@@ -134,20 +134,20 @@ jobs:
           vuln.write_text('import os\nos.system(input())\n', encoding="utf-8")
           sarif = tmp / "out.sarif"
           r_vuln = subprocess.run(
-              [str(bin_path.resolve()), "scan", str(vuln), "--format", "json", "--sarif", str(sarif)],
+              [str(bin_path.resolve()), "scan", str(vuln), "--sarif", str(sarif)],
               cwd=str(tmp), capture_output=True, text=True
           )
-          assert r_vuln.returncode == 1, f"Expected exit 1, got {r_vuln.returncode}\nSTDERR:\n{r_vuln.stderr}"
-          j = json.loads(r_vuln.stdout)
-          assert isinstance(j, dict), type(j)
+          assert r_vuln.returncode == 1, f"Expected exit 1, got {r_vuln.returncode}\nSTDOUT:\n{r_vuln.stdout}\nSTDERR:\n{r_vuln.stderr}"
+          assert "CWE-78" in r_vuln.stdout, f"CWE-78 missing in stdout:\n{r_vuln.stdout}\nSTDERR:\n{r_vuln.stderr}"
+          assert sarif.exists(), f"SARIF file not created. STDOUT:\n{r_vuln.stdout}\nSTDERR:\n{r_vuln.stderr}"
           s = json.loads(sarif.read_text(encoding="utf-8"))
           assert s.get("version") == "2.1.0" and len(s["runs"][0]["results"]) >= 1, "Invalid SARIF output"
 
           clean = tmp / "clean.py"
           clean.write_text("x = 1 + 2\nprint(x)\n", encoding="utf-8")
           r_clean = subprocess.run([str(bin_path.resolve()), "scan", str(clean)], cwd=str(tmp), capture_output=True, text=True)
-          assert r_clean.returncode == 0, f"Expected exit 0 on clean file, got {r_clean.returncode}\nSTDERR:\n{r_clean.stderr}"
-          print("STANDALONE_STRICT_E2E_PASS: JSON + SARIF_2.1.0 + CLEAN_EXIT_0")
+          assert r_clean.returncode == 0, f"Expected exit 0 on clean file, got {r_clean.returncode}\nSTDOUT:\n{r_clean.stdout}\nSTDERR:\n{r_clean.stderr}"
+          print("STANDALONE_STRICT_E2E_PASS: CWE-78 + SARIF_2.1.0 + CLEAN_EXIT_0")
           PYEOF
 
       - name: Build & verify universal py3-none wheel (works on Python 3.8 through 3.15+)
@@ -158,7 +158,7 @@ jobs:
           ASSET_NAME: ${{ matrix.asset_name }}
         run: |
           python - << 'PYEOF'
-          import base64, hashlib, json, os, pathlib, subprocess, sys, tempfile, venv, zipfile
+          import base64, hashlib, json, os, pathlib, subprocess, tempfile, venv, zipfile
 
           ver = os.environ["PKG_VER"].strip()
           plat = os.environ["WHEEL_PLAT"].strip()
@@ -181,7 +181,10 @@ jobs:
               "                b.chmod(st | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)\n"
               "        except OSError:\n"
               "            pass\n"
-              "    return subprocess.run([str(b), *sys.argv[1:]]).returncode\n"
+              "    try:\n"
+              "        return subprocess.run([str(b), *sys.argv[1:]]).returncode\n"
+              "    except KeyboardInterrupt:\n"
+              "        return 130\n"
               "if __name__ == '__main__':\n"
               "    sys.exit(main())\n"
           ).encode("utf-8")
@@ -234,8 +237,8 @@ jobs:
           vf = tmp / "vuln.py"
           vf.write_text('import os\nos.system(input())\n', encoding="utf-8")
           sf = tmp / "whl.sarif"
-          r = subprocess.run([str(vexe), "scan", str(vf), "--format", "json", "--sarif", str(sf)], cwd=str(tmp), capture_output=True, text=True)
-          assert r.returncode == 1, (r.returncode, r.stderr)
+          r = subprocess.run([str(vexe), "scan", str(vf), "--sarif", str(sf)], cwd=str(tmp), capture_output=True, text=True)
+          assert r.returncode == 1 and "CWE-78" in r.stdout, (r.returncode, r.stdout, r.stderr)
           s = json.loads(sf.read_text(encoding="utf-8"))
           assert s.get("version") == "2.1.0" and len(s["runs"][0]["results"]) >= 1
           print("UNIVERSAL_WHEEL_E2E_PASS:", whl_path.name)
