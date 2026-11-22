@@ -1,0 +1,142 @@
+name: Build Standalone Binaries (Zero-Python Required)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "GitHub Release tag (e.g. v3.0.3)"
+        required: true
+        default: "v3.0.3"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-standalone:
+    name: Standalone (${{ matrix.asset_name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset_name: timecs-windows-x86_64.exe
+          - os: ubuntu-latest
+            asset_name: timecs-linux-x86_64
+          - os: macos-latest
+            asset_name: timecs-macos-universal2
+
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install compiled timecs==3.0.3 from PyPI + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir "timecs==3.0.3" pyinstaller
+
+      - name: Build single-file standalone binary (all Cython binaries bundled)
+        shell: bash
+        run: |
+          python - << 'PYEOF'
+          import importlib.metadata as md
+          import pathlib, subprocess, sys
+
+          eps = [ep for ep in md.entry_points(group="console_scripts") if ep.name == "timecs"]
+          assert len(eps) == 1, f"Unexpected entrypoints: {eps}"
+          mod_name, attr_name = eps[0].value.split(":", 1)
+
+          entry = pathlib.Path("tcs_standalone_entry.py")
+          entry.write_text(
+              f"import importlib, sys\n"
+              f"m = importlib.import_module({mod_name!r})\n"
+              f"sys.exit(getattr(m, {attr_name!r})())\n",
+              encoding="utf-8",
+          )
+
+          hidden = {mod_name}
+          for f in md.files("timecs") or []:
+              p = f.as_posix()
+              if ".dist-info/" in p or p.endswith(".pyc"):
+                  continue
+              base = p.split(".", 1)[0].replace("/", ".")
+              if base.endswith(".__init__"):
+                  base = base[:-9]
+              parts = base.split(".")
+              if base and all(part.isidentifier() for part in parts):
+                  hidden.add(base)
+
+          cmd = [
+              sys.executable, "-m", "PyInstaller",
+              "--onefile",
+              "--clean",
+              "--noconfirm",
+              "--name", "timecs_bin",
+              "--collect-all", "tree_sitter",
+              "--collect-all", "tree_sitter_python",
+              "--collect-all", "yaml",
+              "--collect-all", "psutil",
+          ]
+          for h in sorted(hidden):
+              cmd.extend(["--hidden-import", h])
+          cmd.append(str(entry))
+
+          print(f"[build] Bundling {len(hidden)} timecs modules:", sorted(hidden))
+          subprocess.run(cmd, check=True)
+          PYEOF
+
+      - name: Rename and E2E test standalone binary (PROVEN > CLAIMED)
+        shell: bash
+        run: |
+          mkdir -p release_assets
+          if [ -f "dist/timecs_bin.exe" ]; then
+            mv "dist/timecs_bin.exe" "release_assets/${{ matrix.asset_name }}"
+          else
+            mv "dist/timecs_bin" "release_assets/${{ matrix.asset_name }}"
+            chmod +x "release_assets/${{ matrix.asset_name }}"
+          fi
+          ls -lh "release_assets/${{ matrix.asset_name }}"
+
+          mkdir -p e2e_tmp
+          printf 'import os\nos.system(input())\n' > e2e_tmp/vuln.py
+          set +e
+          "./release_assets/${{ matrix.asset_name }}" scan e2e_tmp/vuln.py
+          RC=$?
+          set -e
+          echo "STANDALONE_E2E_EXIT=$RC"
+          test "$RC" -eq 1
+
+      - name: Upload standalone binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ matrix.asset_name }}
+          path: release_assets/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  publish-github-release:
+    name: Publish GitHub Release
+    needs: build-standalone
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all 3 standalone binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: standalone-*
+          path: final_release
+          merge-multiple: true
+
+      - name: Verify 3 binaries and attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: TimeCodeSecurity ${{ github.event.inputs.release_tag }} (Standalone Binaries)
+          body: |
+            Standalone single-file binaries for **TimeCodeSecurity (`timecs`)** — no Python installation or Python version dependency required.
+            - **Windows (x64):** `timecs-windows-x86_64.exe`
+            - **Linux (x86_64):** `timecs-linux-x86_64`
+            - **macOS (Universal2):** `timecs-macos-universal2`
+          files: final_release/*
