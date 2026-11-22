@@ -1,0 +1,407 @@
+name: Boss Arenas Showdown (TimeCS vs Semgrep vs CodeQL)
+
+on:
+  workflow_dispatch:
+    inputs:
+      timecs_version:
+        description: "Official PyPI version of timecs to benchmark"
+        required: true
+        default: "3.0.4"
+        type: string
+      arena_filter:
+        description: "Arena to run (start with litellm for fast proof, then run all)"
+        required: true
+        default: "litellm"
+        type: choice
+        options:
+          - litellm
+          - netbox
+          - langchain
+          - all
+      semgrep_timeout:
+        description: "Per-rule timeout in seconds for Semgrep"
+        required: true
+        default: "20"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  showdown:
+    name: "Arena (${{ matrix.arena }})"
+    if: ${{ github.event.inputs.arena_filter == 'all' || github.event.inputs.arena_filter == matrix.arena }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arena: netbox
+            repo: https://github.com/netbox-community/netbox.git
+            tag: v4.1.7
+            subpath: netbox
+          - arena: litellm
+            repo: https://github.com/BerriAI/litellm.git
+            tag: v1.52.0
+            subpath: litellm
+          - arena: langchain
+            repo: https://github.com/langchain-ai/langchain.git
+            tag: langchain-community==0.3.7
+            subpath: libs
+
+    steps:
+      - name: "Checkout public CI workspace"
+        uses: actions/checkout@v4
+
+      - name: "Set up Python 3.12"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "Shallow clone pinned target arena"
+        shell: bash
+        run: |
+          mkdir -p results
+          git clone --depth 1 --branch "${{ matrix.tag }}" "${{ matrix.repo }}" repo_target
+          rm -rf repo_target/.git
+          test -d "repo_target/${{ matrix.subpath }}"
+          find "repo_target/${{ matrix.subpath }}" -type f -name "*.py" | wc -l > results/py_file_count.txt
+          echo "Target Python files: $(cat results/py_file_count.txt)"
+
+      - name: "Install TimeCS and Semgrep in isolated virtual environments"
+        shell: bash
+        run: |
+          if ! command -v /usr/bin/time >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq time
+          fi
+          python -m venv venv_timecs
+          venv_timecs/bin/pip install --upgrade pip -q
+          venv_timecs/bin/pip install --no-cache-dir -q "timecs==${{ github.event.inputs.timecs_version }}"
+
+          python -m venv venv_semgrep
+          venv_semgrep/bin/pip install --upgrade pip -q
+          venv_semgrep/bin/pip install --no-cache-dir -q semgrep
+
+      - name: "Run TimeCodeSecurity (timecs) at full power"
+        shell: bash
+        run: |
+          set +e
+          /usr/bin/time -v -o results/timecs.time \
+            venv_timecs/bin/timecs scan "repo_target/${{ matrix.subpath }}" --sarif results/timecs.sarif \
+            > results/timecs.stdout.log 2> results/timecs.stderr.log
+          RC=$?
+          set -e
+          echo "TIMECS_EXIT=$RC"
+          tail -n 35 results/timecs.stdout.log || true
+          if [ "$RC" -gt 1 ]; then
+            cat results/timecs.stderr.log || true
+            exit "$RC"
+          fi
+          test -f results/timecs.sarif
+
+      - name: "Run Semgrep (p/python + p/security-audit + p/owasp-top-ten)"
+        shell: bash
+        run: |
+          set +e
+          /usr/bin/time -v -o results/semgrep.time \
+            venv_semgrep/bin/semgrep scan \
+              --config p/python \
+              --config p/security-audit \
+              --config p/owasp-top-ten \
+              --metrics=off \
+              --timeout "${{ github.event.inputs.semgrep_timeout }}" \
+              --max-memory 5000 \
+              --sarif --output results/semgrep.sarif \
+              "repo_target/${{ matrix.subpath }}" \
+              > results/semgrep.stdout.log 2> results/semgrep.stderr.log
+          RC=$?
+          set -e
+          echo "SEMGREP_EXIT=$RC"
+          tail -n 25 results/semgrep.stderr.log || true
+          if [ "$RC" -gt 1 ]; then
+            exit "$RC"
+          fi
+          test -f results/semgrep.sarif
+
+      - name: "Initialize CodeQL (Python security-extended)"
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-extended
+          source-root: repo_target/${{ matrix.subpath }}
+
+      - name: "Record CodeQL start timestamp"
+        shell: bash
+        run: date +%s > results/codeql.start
+
+      - name: "Run CodeQL Analysis (local SARIF only)"
+        uses: github/codeql-action/analyze@v3
+        with:
+          output: results/codeql
+          upload: false
+
+      - name: "Record CodeQL end timestamp and verify SARIF"
+        shell: bash
+        run: |
+          date +%s > results/codeql.end
+          test -f results/codeql/python.sarif
+
+      - name: "Generate 3-Tool Scoreboard and FP Triage Report (v3.1.0 Prep)"
+        shell: bash
+        env:
+          ARENA: ${{ matrix.arena }}
+          SUBPATH: ${{ matrix.subpath }}
+          TIMECS_VER: ${{ github.event.inputs.timecs_version }}
+        run: |
+          python - << 'PYEOF'
+          import collections
+          import json
+          import os
+          import pathlib
+          import re
+          import urllib.parse
+
+          arena = os.environ["ARENA"]
+          subpath = os.environ["SUBPATH"].strip("/")
+          timecs_ver = os.environ["TIMECS_VER"]
+          target_root = pathlib.Path("repo_target") / subpath
+          py_files = int(pathlib.Path("results/py_file_count.txt").read_text(encoding="utf-8").strip())
+
+          def parse_gnu_time(path_str):
+              p = pathlib.Path(path_str)
+              if not p.exists():
+                  return None, None
+              txt = p.read_text(encoding="utf-8", errors="replace")
+              wall_s = None
+              rss_mb = None
+              m_wall = re.search(r"Elapsed \(wall clock\) time.*?:\s*([0-9:.]+)", txt)
+              if m_wall:
+                  parts = [float(x) for x in m_wall.group(1).split(":")]
+                  if len(parts) == 3:
+                      wall_s = round(parts[0] * 3600 + parts[1] * 60 + parts[2], 2)
+                  elif len(parts) == 2:
+                      wall_s = round(parts[0] * 60 + parts[1], 2)
+              m_rss = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", txt)
+              if m_rss:
+                  rss_mb = round(int(m_rss.group(1)) / 1024.0, 1)
+              return wall_s, rss_mb
+
+          tc_wall, tc_rss = parse_gnu_time("results/timecs.time")
+          sg_wall, sg_rss = parse_gnu_time("results/semgrep.time")
+          cq_wall = round(
+              float(pathlib.Path("results/codeql.end").read_text().strip())
+              - float(pathlib.Path("results/codeql.start").read_text().strip()),
+              2,
+          )
+
+          def norm_rel_path(uri):
+              if not uri:
+                  return ""
+              u = urllib.parse.unquote(uri).replace("\\", "/")
+              if u.startswith("file://"):
+                  u = u[7:]
+              u = u.lstrip("/")
+              while u.startswith("./"):
+                  u = u[2:]
+              marker = f"repo_target/{subpath}/"
+              if marker in u:
+                  u = u.split(marker, 1)[1]
+              elif u.startswith(f"{subpath}/"):
+                  u = u[len(subpath) + 1 :]
+              return u
+
+          def extract_cwe(rule_id, props, msg):
+              for text in [rule_id, msg] + [str(t) for t in (props.get("tags") or [])]:
+                  m = re.search(r"CWE-\d+", text, re.IGNORECASE)
+                  if m:
+                      return m.group(0).upper()
+              return "N/A"
+
+          def load_sarif(path_str, tool_label):
+              data = json.loads(pathlib.Path(path_str).read_text(encoding="utf-8"))
+              items = []
+              for run in data.get("runs") or []:
+                  for res in run.get("results") or []:
+                      rule_id = str(res.get("ruleId") or "UNKNOWN")
+                      msg = str((res.get("message") or {}).get("text") or "").strip()
+                      props = res.get("properties") or {}
+                      cwe = extract_cwe(rule_id, props, msg)
+                      locs = res.get("locations") or []
+                      uri = ""
+                      line = 1
+                      if locs:
+                          phys = locs[0].get("physicalLocation") or {}
+                          uri = ((phys.get("artifactLocation") or {}).get("uri")) or ""
+                          line = int(((phys.get("region") or {}).get("startLine")) or 1)
+                      rel = norm_rel_path(uri)
+                      if not rel:
+                          continue
+                      items.append(
+                          {
+                              "tool": tool_label,
+                              "file": rel,
+                              "line": line,
+                              "rule_id": rule_id,
+                              "cwe": cwe,
+                              "message": msg,
+                              "agreed": False,
+                          }
+                      )
+              return items
+
+          tc_items = load_sarif("results/timecs.sarif", "TimeCodeSecurity")
+          sg_items = load_sarif("results/semgrep.sarif", "Semgrep")
+          cq_items = load_sarif("results/codeql/python.sarif", "CodeQL")
+          all_items = tc_items + sg_items + cq_items
+
+          by_file = collections.defaultdict(list)
+          for it in all_items:
+              by_file[it["file"]].append(it)
+
+          for fpath, fitems in by_file.items():
+              fitems.sort(key=lambda x: x["line"])
+              cluster = []
+              for it in fitems:
+                  if not cluster or (it["line"] - cluster[-1]["line"]) <= 2:
+                      cluster.append(it)
+                  else:
+                      if len({x["tool"] for x in cluster}) >= 2:
+                          for x in cluster:
+                              x["agreed"] = True
+                      cluster = [it]
+              if cluster and len({x["tool"] for x in cluster}) >= 2:
+                  for x in cluster:
+                      x["agreed"] = True
+
+          def stats_for(items, wall, rss):
+              total = len(items)
+              agreed = sum(1 for x in items if x["agreed"])
+              only = total - agreed
+              return {
+                  "files_scanned": py_files,
+                  "files_with_findings": len({x["file"] for x in items}),
+                  "total": total,
+                  "agreed": agreed,
+                  "tool_only": only,
+                  "wall_s": wall,
+                  "peak_ram_mb": rss,
+              }
+
+          st_tc = stats_for(tc_items, tc_wall, tc_rss)
+          st_sg = stats_for(sg_items, sg_wall, sg_rss)
+          st_cq = stats_for(cq_items, cq_wall, "n/a (action)")
+
+          tc_only = [x for x in tc_items if not x["agreed"]]
+          grouped = collections.defaultdict(list)
+          for x in tc_only:
+              short_msg = re.sub(r"\s+", " ", x["message"])[:110]
+              grouped[(x["rule_id"], x["cwe"], short_msg)].append(x)
+
+          ranked_groups = sorted(grouped.items(), key=lambda kv: len(kv[1]), reverse=True)
+
+          def get_snippet(rel_file, target_line):
+              fp = target_root / rel_file
+              if not fp.exists():
+                  return "<source file unavailable>"
+              try:
+                  lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+              except Exception:
+                  return "<unreadable file>"
+              start = max(1, target_line - 2)
+              end = min(len(lines), target_line + 2)
+              out = []
+              for ln in range(start, end + 1):
+                  mark = ">>>" if ln == target_line else "   "
+                  out.append(f"{mark} {ln:4d} | {lines[ln - 1]}")
+              return "\n".join(out)
+
+          samples = []
+          idx = 0
+          while len(samples) < 40 and ranked_groups:
+              added_in_round = False
+              for (rid, cwe, smsg), members in ranked_groups:
+                  if idx < len(members) and len(samples) < 40:
+                      m = members[idx]
+                      samples.append(
+                          {
+                              "rule_id": rid,
+                              "cwe": cwe,
+                              "message": m["message"],
+                              "file": m["file"],
+                              "line": m["line"],
+                              "snippet": get_snippet(m["file"], m["line"]),
+                          }
+                      )
+                      added_in_round = True
+              if not added_in_round:
+                  break
+              idx += 1
+
+          md = []
+          md.append(f"# Boss Arena Showdown: `{arena}` (`timecs=={timecs_ver}` vs `Semgrep` vs `CodeQL`)\n")
+          md.append("| Arena | Tool | Files Scanned | Total Findings | Agreed (2+ Tools) | Tool-Only Findings | Wall Time (s) | Peak RAM (MB) |")
+          md.append("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |")
+          for tname, st in [
+              (f"TimeCodeSecurity ({timecs_ver})", st_tc),
+              ("Semgrep (security-audit+owasp)", st_sg),
+              ("CodeQL (security-extended)", st_cq),
+          ]:
+              md.append(
+                  f"| {arena} | {tname} | {st['files_scanned']} | {st['total']} | {st['agreed']} | {st['tool_only']} | {st['wall_s']} | {st['peak_ram_mb']} |"
+              )
+
+          md.append("\n## Top `TIMECS_ONLY` Rule Groups (Primary FP Triage Targets for v3.1.0)\n")
+          if not ranked_groups:
+              md.append("Zero `TIMECS_ONLY` findings — 100% of TimeCodeSecurity findings were corroborated by Semgrep or CodeQL!\n")
+          else:
+              md.append("| Rank | Count | CWE | Rule ID | Message |")
+              md.append("| ---: | ---: | :--- | :--- | :--- |")
+              for r_i, ((rid, cwe, smsg), members) in enumerate(ranked_groups[:25], 1):
+                  safe_msg = smsg.replace("|", "\\|")
+                  md.append(f"| {r_i} | {len(members)} | {cwe} | `{rid}` | {safe_msg} |")
+
+          md.append("\n## Top 40 `TIMECS_ONLY` Code Windows (Exact Lines for Permanent FP Fixes)\n")
+          for s_i, smp in enumerate(samples, 1):
+              md.append(f"### {s_i}. `{smp['file']}:{smp['line']}` — `{smp['rule_id']}` ({smp['cwe']})")
+              md.append(f"**Message:** {smp['message']}\n")
+              md.append("```python")
+              md.append(smp["snippet"])
+              md.append("```\n")
+
+          report_text = "\n".join(md)
+          pathlib.Path("results/fp_triage_report.md").write_text(report_text, encoding="utf-8")
+
+          summary_obj = {
+              "arena": arena,
+              "timecs_version": timecs_ver,
+              "scoreboard": {
+                  "timecs": st_tc,
+                  "semgrep": st_sg,
+                  "codeql": st_cq,
+              },
+              "top_timecs_only_groups": [
+                  {"rule_id": rid, "cwe": cwe, "message": smsg, "count": len(members)}
+                  for (rid, cwe, smsg), members in ranked_groups[:25]
+              ],
+              "timecs_only_samples": samples,
+          }
+          pathlib.Path("results/benchmark_summary.json").write_text(
+              json.dumps(summary_obj, indent=2), encoding="utf-8"
+          )
+
+          step_sum = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_sum:
+              with open(step_sum, "a", encoding="utf-8") as fh:
+                  fh.write("\n".join(md[:40]) + "\n")
+
+          print("TRIAGE_REPORT_GENERATED_SUCCESSFULLY")
+          PYEOF
+
+      - name: "Upload showdown SARIF and FP triage artifacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boss-showdown-${{ matrix.arena }}
+          path: results/
+          retention-days: 30
