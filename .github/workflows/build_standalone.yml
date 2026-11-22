@@ -47,13 +47,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --no-cache-dir "timecs==3.0.3" pyinstaller
 
-      - name: Build standalone binary with full Python stdlib + Cython modules
+      - name: Build standalone binary with full Python stdlib submodules + Cython modules
         shell: bash
         run: |
           python - << 'PYEOF'
           import importlib.metadata as md
           import importlib.util
-          import pathlib, subprocess, sys
+          import pathlib, pkgutil, subprocess, sys
 
           eps = [ep for ep in md.entry_points(group="console_scripts") if ep.name == "timecs"]
           assert len(eps) == 1, f"Unexpected entrypoints: {eps}"
@@ -69,17 +69,29 @@ jobs:
 
           skip_stdlib = {
               "antigravity", "ensurepip", "idlelib", "lib2to3",
-              "pydoc_data", "test", "this", "tkinter", "turtle", "turtledemo",
+              "pydoc_data", "test", "this", "tkinter", "turtle", "turtledemo", "venv",
           }
           hidden = {mod_name}
           for name in sorted(sys.stdlib_module_names):
               if name in skip_stdlib or name.startswith("_"):
                   continue
               try:
-                  if importlib.util.find_spec(name) is not None:
-                      hidden.add(name)
+                  spec = importlib.util.find_spec(name)
               except Exception:
-                  pass
+                  spec = None
+              if spec is None:
+                  continue
+              hidden.add(name)
+              if spec.submodule_search_locations:
+                  for _, subname, _ in pkgutil.walk_packages(
+                      spec.submodule_search_locations,
+                      prefix=name + ".",
+                      onerror=lambda _: None,
+                  ):
+                      parts = subname.split(".")
+                      if any(p.startswith("_") or p in ("test", "tests") for p in parts):
+                          continue
+                      hidden.add(subname)
 
           for f in md.files("timecs") or []:
               p = f.as_posix()
@@ -107,7 +119,7 @@ jobs:
               cmd.extend(["--hidden-import", h])
           cmd.append(str(entry))
 
-          print(f"[build] Bundling {len(hidden)} stdlib + timecs modules")
+          print(f"[build] Bundling {len(hidden)} stdlib + submodule + timecs modules")
           subprocess.run(cmd, check=True)
           PYEOF
 
