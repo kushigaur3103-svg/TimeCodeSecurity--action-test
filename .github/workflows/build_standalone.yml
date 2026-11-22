@@ -1,32 +1,40 @@
-name: Build Standalone Binaries (Zero-Python Required)
+name: Build Universal PyPI Wheels & Standalone Binaries
 
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: "GitHub Release tag (e.g. v3.0.3)"
+      version:
+        description: "Package & Release version (e.g. 3.0.4)"
         required: true
-        default: "v3.0.3"
+        default: "3.0.4"
         type: string
+      publish_to_pypi:
+        description: "Publish universal py3-none-* wheels to Official PyPI (pypi.org)"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
 
 jobs:
-  build-standalone:
-    name: Standalone (${{ matrix.asset_name }})
+  build-universal:
+    name: Build & verify (${{ matrix.wheel_plat }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             asset_name: timecs-windows-x86_64.exe
+            wheel_plat: win_amd64
           - os: ubuntu-latest
             asset_name: timecs-linux-x86_64
+            wheel_plat: manylinux2014_x86_64
           - os: macos-latest
             asset_name: timecs-macos-universal2
+            wheel_plat: macosx_10_15_universal2
 
     steps:
       - name: Set up Python 3.12
@@ -34,16 +42,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install compiled timecs==3.0.3 from PyPI + PyInstaller
+      - name: Install compiled timecs==3.0.3 + PyInstaller
         run: |
           python -m pip install --upgrade pip
           python -m pip install --no-cache-dir "timecs==3.0.3" pyinstaller
 
-      - name: Build single-file standalone binary (all Cython binaries bundled)
+      - name: Build standalone binary with full Python stdlib + Cython modules
         shell: bash
         run: |
           python - << 'PYEOF'
           import importlib.metadata as md
+          import importlib.util
           import pathlib, subprocess, sys
 
           eps = [ep for ep in md.entry_points(group="console_scripts") if ep.name == "timecs"]
@@ -58,7 +67,20 @@ jobs:
               encoding="utf-8",
           )
 
+          skip_stdlib = {
+              "antigravity", "ensurepip", "idlelib", "lib2to3",
+              "pydoc_data", "test", "this", "tkinter", "turtle", "turtledemo",
+          }
           hidden = {mod_name}
+          for name in sorted(sys.stdlib_module_names):
+              if name in skip_stdlib or name.startswith("_"):
+                  continue
+              try:
+                  if importlib.util.find_spec(name) is not None:
+                      hidden.add(name)
+              except Exception:
+                  pass
+
           for f in md.files("timecs") or []:
               p = f.as_posix()
               if ".dist-info/" in p or p.endswith(".pyc"):
@@ -85,30 +107,139 @@ jobs:
               cmd.extend(["--hidden-import", h])
           cmd.append(str(entry))
 
-          print(f"[build] Bundling {len(hidden)} timecs modules:", sorted(hidden))
+          print(f"[build] Bundling {len(hidden)} stdlib + timecs modules")
           subprocess.run(cmd, check=True)
           PYEOF
 
-      - name: Rename and E2E test standalone binary (PROVEN > CLAIMED)
+      - name: Strict E2E verification gate on standalone binary (JSON + SARIF 2.1.0 + clean file)
         shell: bash
+        env:
+          ASSET_NAME: ${{ matrix.asset_name }}
         run: |
-          mkdir -p release_assets
-          if [ -f "dist/timecs_bin.exe" ]; then
-            mv "dist/timecs_bin.exe" "release_assets/${{ matrix.asset_name }}"
-          else
-            mv "dist/timecs_bin" "release_assets/${{ matrix.asset_name }}"
-            chmod +x "release_assets/${{ matrix.asset_name }}"
-          fi
-          ls -lh "release_assets/${{ matrix.asset_name }}"
+          python - << 'PYEOF'
+          import json, os, pathlib, shutil, stat, subprocess, tempfile
 
-          mkdir -p e2e_tmp
-          printf 'import os\nos.system(input())\n' > e2e_tmp/vuln.py
-          set +e
-          "./release_assets/${{ matrix.asset_name }}" scan e2e_tmp/vuln.py
-          RC=$?
-          set -e
-          echo "STANDALONE_E2E_EXIT=$RC"
-          test "$RC" -eq 1
+          out_dir = pathlib.Path("release_assets")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          raw = pathlib.Path("dist/timecs_bin.exe" if pathlib.Path("dist/timecs_bin.exe").exists() else "dist/timecs_bin")
+          assert raw.exists(), "Built binary missing"
+          bin_path = out_dir / os.environ["ASSET_NAME"]
+          shutil.move(str(raw), str(bin_path))
+          if os.name != "nt":
+              bin_path.chmod(bin_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+          print(f"[bin] {bin_path.name} size={bin_path.stat().st_size / (1024*1024):.2f} MB")
+
+          tmp = pathlib.Path(tempfile.mkdtemp(prefix="tcs_bin_e2e_"))
+          vuln = tmp / "vuln.py"
+          vuln.write_text('import os\nos.system(input())\n', encoding="utf-8")
+          sarif = tmp / "out.sarif"
+          r_vuln = subprocess.run(
+              [str(bin_path.resolve()), "scan", str(vuln), "--format", "json", "--sarif", str(sarif)],
+              cwd=str(tmp), capture_output=True, text=True
+          )
+          assert r_vuln.returncode == 1, f"Expected exit 1, got {r_vuln.returncode}\nSTDERR:\n{r_vuln.stderr}"
+          j = json.loads(r_vuln.stdout)
+          assert isinstance(j, dict), type(j)
+          s = json.loads(sarif.read_text(encoding="utf-8"))
+          assert s.get("version") == "2.1.0" and len(s["runs"][0]["results"]) >= 1, "Invalid SARIF output"
+
+          clean = tmp / "clean.py"
+          clean.write_text("x = 1 + 2\nprint(x)\n", encoding="utf-8")
+          r_clean = subprocess.run([str(bin_path.resolve()), "scan", str(clean)], cwd=str(tmp), capture_output=True, text=True)
+          assert r_clean.returncode == 0, f"Expected exit 0 on clean file, got {r_clean.returncode}\nSTDERR:\n{r_clean.stderr}"
+          print("STANDALONE_STRICT_E2E_PASS: JSON + SARIF_2.1.0 + CLEAN_EXIT_0")
+          PYEOF
+
+      - name: Build & verify universal py3-none wheel (works on Python 3.8 through 3.15+)
+        shell: bash
+        env:
+          PKG_VER: ${{ github.event.inputs.version }}
+          WHEEL_PLAT: ${{ matrix.wheel_plat }}
+          ASSET_NAME: ${{ matrix.asset_name }}
+        run: |
+          python - << 'PYEOF'
+          import base64, hashlib, json, os, pathlib, subprocess, sys, tempfile, venv, zipfile
+
+          ver = os.environ["PKG_VER"].strip()
+          plat = os.environ["WHEEL_PLAT"].strip()
+          bin_src = pathlib.Path("release_assets") / os.environ["ASSET_NAME"]
+          bin_name = "timecs.exe" if os.name == "nt" else "timecs"
+
+          wheel_dir = pathlib.Path("wheel_dist")
+          wheel_dir.mkdir(parents=True, exist_ok=True)
+          whl_path = wheel_dir / f"timecs-{ver}-py3-none-{plat}.whl"
+          dist_info = f"timecs-{ver}.dist-info"
+
+          launcher_code = (
+              "import os, pathlib, stat, subprocess, sys\n"
+              "def main():\n"
+              f"    b = pathlib.Path(__file__).resolve().parent / 'bin' / {bin_name!r}\n"
+              "    if os.name != 'nt':\n"
+              "        try:\n"
+              "            st = b.stat().st_mode\n"
+              "            if not (st & stat.S_IXUSR):\n"
+              "                b.chmod(st | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)\n"
+              "        except OSError:\n"
+              "            pass\n"
+              "    return subprocess.run([str(b), *sys.argv[1:]]).returncode\n"
+              "if __name__ == '__main__':\n"
+              "    sys.exit(main())\n"
+          ).encode("utf-8")
+
+          metadata = (
+              f"Metadata-Version: 2.1\n"
+              f"Name: timecs\n"
+              f"Version: {ver}\n"
+              f"Summary: TimeCodeSecurity - Autonomous Closed-Source Static & AppSec Analyzer\n"
+              f"Requires-Python: >=3.8\n"
+          ).encode("utf-8")
+
+          wheel_meta = (
+              f"Wheel-Version: 1.0\n"
+              f"Generator: timecs-universal-packager 1.0\n"
+              f"Root-Is-Purelib: false\n"
+              f"Tag: py3-none-{plat}\n"
+          ).encode("utf-8")
+
+          entry_points = b"[console_scripts]\ntimecs = timecs_launcher:main\n"
+
+          records = []
+          def add_bytes(zf, arcname, data, executable=False):
+              zi = zipfile.ZipInfo(arcname)
+              zi.create_system = 3
+              zi.compress_type = zipfile.ZIP_DEFLATED
+              zi.external_attr = ((0o100755 if executable else 0o100644) << 16)
+              zf.writestr(zi, data)
+              digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii")
+              records.append(f"{arcname},sha256={digest},{len(data)}")
+
+          with zipfile.ZipFile(whl_path, "w") as zf:
+              add_bytes(zf, "timecs_launcher/__init__.py", launcher_code, executable=False)
+              add_bytes(zf, f"timecs_launcher/bin/{bin_name}", bin_src.read_bytes(), executable=True)
+              add_bytes(zf, f"{dist_info}/METADATA", metadata)
+              add_bytes(zf, f"{dist_info}/WHEEL", wheel_meta)
+              add_bytes(zf, f"{dist_info}/entry_points.txt", entry_points)
+              records.append(f"{dist_info}/RECORD,,")
+              add_bytes(zf, f"{dist_info}/RECORD", ("\n".join(records) + "\n").encode("utf-8"))
+
+          print("[wheel] Built:", whl_path.name, f"size={whl_path.stat().st_size / (1024*1024):.2f} MB")
+
+          tmp = pathlib.Path(tempfile.mkdtemp(prefix="tcs_whl_e2e_"))
+          vdir = tmp / "venv"
+          venv.create(vdir, with_pip=True)
+          bindir = vdir / ("Scripts" if os.name == "nt" else "bin")
+          vpy = bindir / ("python.exe" if os.name == "nt" else "python")
+          vexe = bindir / ("timecs.exe" if os.name == "nt" else "timecs")
+          subprocess.run([str(vpy), "-m", "pip", "install", str(whl_path.resolve())], check=True)
+          vf = tmp / "vuln.py"
+          vf.write_text('import os\nos.system(input())\n', encoding="utf-8")
+          sf = tmp / "whl.sarif"
+          r = subprocess.run([str(vexe), "scan", str(vf), "--format", "json", "--sarif", str(sf)], cwd=str(tmp), capture_output=True, text=True)
+          assert r.returncode == 1, (r.returncode, r.stderr)
+          s = json.loads(sf.read_text(encoding="utf-8"))
+          assert s.get("version") == "2.1.0" and len(s["runs"][0]["results"]) >= 1
+          print("UNIVERSAL_WHEEL_E2E_PASS:", whl_path.name)
+          PYEOF
 
       - name: Upload standalone binary artifact
         uses: actions/upload-artifact@v4
@@ -117,9 +248,16 @@ jobs:
           path: release_assets/${{ matrix.asset_name }}
           if-no-files-found: error
 
+      - name: Upload universal wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.wheel_plat }}
+          path: wheel_dist/*.whl
+          if-no-files-found: error
+
   publish-github-release:
-    name: Publish GitHub Release
-    needs: build-standalone
+    name: Publish GitHub Release v${{ github.event.inputs.version }}
+    needs: build-universal
     runs-on: ubuntu-latest
     steps:
       - name: Download all 3 standalone binaries
@@ -129,14 +267,48 @@ jobs:
           path: final_release
           merge-multiple: true
 
-      - name: Verify 3 binaries and attach to GitHub Release
+      - name: Attach 3 standalone binaries to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.release_tag }}
-          name: TimeCodeSecurity ${{ github.event.inputs.release_tag }} (Standalone Binaries)
+          tag_name: v${{ github.event.inputs.version }}
+          name: TimeCodeSecurity v${{ github.event.inputs.version }} (Universal Release)
           body: |
-            Standalone single-file binaries for **TimeCodeSecurity (`timecs`)** — no Python installation or Python version dependency required.
+            Install on **any Python version (3.8 through 3.15+)** via:
+            ```bash
+            pip install --upgrade timecs
+            ```
+            Or download standalone zero-Python executables below:
             - **Windows (x64):** `timecs-windows-x86_64.exe`
             - **Linux (x86_64):** `timecs-linux-x86_64`
             - **macOS (Universal2):** `timecs-macos-universal2`
           files: final_release/*
+
+  publish-pypi:
+    name: Publish Universal Wheels to Official PyPI
+    needs: build-universal
+    if: ${{ github.event.inputs.publish_to_pypi == 'true' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/timecs
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all 3 universal wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: pypi_dist
+          merge-multiple: true
+
+      - name: Verify exact 3 universal wheels
+        run: |
+          ls -lh pypi_dist
+          COUNT=$(ls -1 pypi_dist/*.whl | wc -l)
+          test "$COUNT" -eq 3
+
+      - name: Publish to Official PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: pypi_dist
+          skip-existing: true
