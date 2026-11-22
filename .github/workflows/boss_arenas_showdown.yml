@@ -28,27 +28,58 @@ permissions:
   contents: read
 
 jobs:
+  plan:
+    name: "Select Boss Arenas"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: "Build filtered arena matrix"
+        id: set-matrix
+        shell: bash
+        env:
+          ARENA_FILTER: ${{ github.event.inputs.arena_filter }}
+        run: |
+          python - << 'PYEOF'
+          import json, os
+
+          arenas = [
+              {
+                  "arena": "netbox",
+                  "repo": "https://github.com/netbox-community/netbox.git",
+                  "tag": "v4.1.7",
+                  "subpath": "netbox",
+              },
+              {
+                  "arena": "litellm",
+                  "repo": "https://github.com/BerriAI/litellm.git",
+                  "tag": "v1.52.0",
+                  "subpath": "litellm",
+              },
+              {
+                  "arena": "langchain",
+                  "repo": "https://github.com/langchain-ai/langchain.git",
+                  "tag": "langchain-community==0.3.7",
+                  "subpath": "libs",
+              },
+          ]
+          flt = os.environ.get("ARENA_FILTER", "litellm").strip()
+          selected = arenas if flt == "all" else [a for a in arenas if a["arena"] == flt]
+          assert selected, f"No arena matched filter: {flt}"
+          payload = json.dumps({"include": selected}, separators=(",", ":"))
+          print("Selected matrix:", payload)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"matrix={payload}\n")
+          PYEOF
+
   showdown:
     name: "Arena (${{ matrix.arena }})"
-    if: ${{ github.event.inputs.arena_filter == 'all' || github.event.inputs.arena_filter == matrix.arena }}
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arena: netbox
-            repo: https://github.com/netbox-community/netbox.git
-            tag: v4.1.7
-            subpath: netbox
-          - arena: litellm
-            repo: https://github.com/BerriAI/litellm.git
-            tag: v1.52.0
-            subpath: litellm
-          - arena: langchain
-            repo: https://github.com/langchain-ai/langchain.git
-            tag: langchain-community==0.3.7
-            subpath: libs
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
 
     steps:
       - name: "Checkout public CI workspace"
